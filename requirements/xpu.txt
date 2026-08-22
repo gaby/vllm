@@ -3,12 +3,12 @@
 --extra-index-url=https://wheels.vllm.ai/xpu/
 triton==3.7.2+xpu
 
-ray>=2.9
+ray>=2.56.0
 cmake>=3.26.1
 packaging>=24.2
 setuptools-scm>=8
 setuptools-rust>=1.9.0
-setuptools>=77.0.3,<81.0.0
+setuptools>=83.0.0,<84.0.0
 wheel
 jinja2>=3.1.6
 datasets # for benchmark scripts
