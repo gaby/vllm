@@ -6,6 +6,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from pydantic import ValidationError
 
 from vllm.config.multimodal import MultiModalConfig
 from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
@@ -751,4 +752,22 @@ def test_non_numeric_logprobs_rejected(field_name):
             prompt="Test prompt",
             max_tokens=10,
             **{field_name: "2"},
+        )
+
+
+@pytest.mark.parametrize("structured_outputs", ["json", ["json"], 1])
+def test_non_object_structured_outputs_rejected(structured_outputs):
+    """`structured_outputs` that is not an object must be a clean 400.
+
+    `check_structured_outputs_count` runs at mode='before' and called
+    `.get()` on the raw value, so a scalar or list raised AttributeError,
+    which escapes Pydantic and surfaces as HTTP 500.
+    """
+    with pytest.raises(ValidationError):
+        CompletionRequest.model_validate(
+            {
+                "model": MODEL_NAME,
+                "prompt": "Test prompt",
+                "structured_outputs": structured_outputs,
+            }
         )

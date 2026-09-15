@@ -4,6 +4,7 @@
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
 import time
+from collections.abc import Iterable
 from typing import Annotated, Any, ClassVar, Literal
 
 from openai.types.chat.chat_completion_audio import (
@@ -561,7 +562,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
         Performs two normalizations in a single pass:
         - Converts tool_calls generators/iterators to lists so one-shot
-          generators are not consumed during union type matching.
+          generators are not consumed during union type matching. A
+          non-iterable is left alone for Pydantic's field validation to
+          report, since list() would raise TypeError first.
         - Renames the deprecated ``reasoning_content`` field to
           ``reasoning`` so downstream code only needs to check one field.
         """
@@ -574,7 +577,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             if not isinstance(msg, dict):
                 continue
             tool_calls = msg.get("tool_calls")
-            if tool_calls is not None and not isinstance(tool_calls, list):
+            if isinstance(tool_calls, Iterable) and not isinstance(tool_calls, list):
                 msg["tool_calls"] = list(tool_calls)
             reasoning_content = msg.pop("reasoning_content", None)
             if reasoning_content is not None and msg.get("reasoning") is None:
@@ -905,6 +908,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
         # structured_outputs may arrive as a dict (from JSON/raw kwargs) or
         # as a StructuredOutputsParams dataclass instance.
         is_dataclass = isinstance(structured_outputs_kwargs, StructuredOutputsParams)
+        if not is_dataclass and not isinstance(structured_outputs_kwargs, dict):
+            # Any other type is left to Pydantic's field validation, which
+            # names the field; the .get() below would raise AttributeError
+            # first, which escapes Pydantic as an HTTP 500.
+            return data
         count = sum(
             (
                 getattr(structured_outputs_kwargs, k, None)

@@ -467,6 +467,11 @@ class CompletionRequest(OpenAIBaseModel):
         # structured_outputs may arrive as a dict (from JSON/raw kwargs) or
         # as a StructuredOutputsParams dataclass instance.
         is_dataclass = isinstance(structured_outputs_kwargs, StructuredOutputsParams)
+        if not is_dataclass and not isinstance(structured_outputs_kwargs, dict):
+            # Any other type is left to Pydantic's field validation, which
+            # names the field; the .get() below would raise AttributeError
+            # first, which escapes Pydantic as an HTTP 500.
+            return data
         count = sum(
             (
                 getattr(structured_outputs_kwargs, k, None)

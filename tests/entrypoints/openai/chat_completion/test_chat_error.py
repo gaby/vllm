@@ -595,3 +595,36 @@ def test_named_tool_choice_matching_well_formed_tool_accepted():
         }
     )
     assert request.tool_choice.function.name == "get_weather"
+
+
+@pytest.mark.parametrize("structured_outputs", ["json", ["json"], 1])
+def test_non_object_structured_outputs_rejected(structured_outputs):
+    """`structured_outputs` that is not an object must be a clean 400.
+
+    `check_structured_outputs_count` runs at mode='before' and called
+    `.get()` on the raw value, so a scalar or list raised AttributeError,
+    which escapes Pydantic and surfaces as HTTP 500.
+    """
+    with pytest.raises(ValidationError):
+        ChatCompletionRequest.model_validate(
+            {
+                "model": MODEL_NAME,
+                "messages": [{"role": "user", "content": "hello"}],
+                "structured_outputs": structured_outputs,
+            }
+        )
+
+
+def test_non_iterable_tool_calls_rejected():
+    """A non-iterable `tool_calls` must be reported by field validation.
+
+    `_normalize_messages_before` materializes iterators with `list()`, which
+    raised TypeError on a scalar before Pydantic could name the field.
+    """
+    with pytest.raises(ValidationError):
+        ChatCompletionRequest.model_validate(
+            {
+                "model": MODEL_NAME,
+                "messages": [{"role": "assistant", "tool_calls": 5}],
+            }
+        )

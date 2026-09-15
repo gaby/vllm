@@ -6,6 +6,7 @@ import json
 
 import pytest
 from openai.types.responses import ResponseFunctionToolCall, ResponseOutputMessage
+from pydantic import ValidationError
 
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 
@@ -377,3 +378,16 @@ def test_assistant_output_style_content_coerced():
     assert item.content[0].annotations == []
     assert item.status == "completed"
     assert item.id.startswith("msg_")
+
+
+@pytest.mark.parametrize("tools", [5, "get_weather", {"type": "function"}])
+def test_non_list_tools_rejected(tools):
+    """`tools` that is not a list must be reported by field validation.
+
+    `check_tool_usage` runs at mode='before' and called `len()` on the raw
+    value, raising TypeError before Pydantic could name the field.
+    """
+    with pytest.raises(ValidationError):
+        ResponsesRequest.model_validate(
+            {"model": "gpt2", "input": "hello", "tools": tools}
+        )

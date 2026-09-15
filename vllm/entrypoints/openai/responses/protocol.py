@@ -608,6 +608,10 @@ class ResponsesRequest(OpenAIBaseModel):
             return data
 
         tools = data.get("tools")
+        if tools is not None and not isinstance(tools, list):
+            # Pydantic's field validation names the field; the len() below
+            # would raise TypeError first.
+            return data
         tool_choice = data.get("tool_choice", "auto")
         has_tools = tools is not None and len(tools) > 0
         is_named_tool_choice = (
