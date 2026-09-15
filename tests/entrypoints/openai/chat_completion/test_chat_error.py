@@ -6,6 +6,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from vllm.config.multimodal import MultiModalConfig
 from vllm.entrypoints.openai.chat_completion.protocol import (
@@ -526,3 +527,71 @@ def test_non_numeric_logprobs_rejected(field_name):
             messages=[{"role": "user", "content": "hello"}],
             **{field_name: "2"},
         )
+
+
+NAMED_TOOL_CHOICE = {"type": "function", "function": {"name": "get_weather"}}
+WELL_FORMED_TOOL = {
+    "type": "function",
+    "function": {"name": "get_weather", "parameters": {"type": "object"}},
+}
+
+
+@pytest.mark.parametrize(
+    "tools",
+    [
+        # Responses-API tool shape sent to Chat Completions (no `function` key)
+        [{"type": "function", "name": "get_weather", "parameters": {}}],
+        [{"type": "function"}],
+        [{"type": "function", "function": {"description": "no name"}}],
+        [{"type": "function", "function": "get_weather"}],
+        ["get_weather"],
+        [None],
+        [{"type": "function"}, WELL_FORMED_TOOL],
+        # `tools` that is not a list at all
+        {"type": "function", "function": {"name": "get_weather"}},
+        "get_weather",
+        5,
+    ],
+)
+def test_malformed_tools_with_named_tool_choice_rejected(tools):
+    """A named `tool_choice` must not make malformed `tools` a 500.
+
+    `check_tool_usage` runs at mode='before', so it sees raw JSON: indexing
+    entries there raised KeyError/TypeError, which escape Pydantic and
+    surface as HTTP 500 (KeyError) or a 400 leaking a Python message
+    (TypeError). Pydantic's field validation must report them instead.
+    """
+    with pytest.raises(ValidationError):
+        ChatCompletionRequest.model_validate(
+            {
+                "model": MODEL_NAME,
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": tools,
+                "tool_choice": NAMED_TOOL_CHOICE,
+            }
+        )
+
+
+def test_named_tool_choice_not_in_well_formed_tools_rejected():
+    """A tool_choice naming an absent tool is still its own error."""
+    with pytest.raises(VLLMValidationError, match="does not match any"):
+        ChatCompletionRequest.model_validate(
+            {
+                "model": MODEL_NAME,
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [WELL_FORMED_TOOL],
+                "tool_choice": {"type": "function", "function": {"name": "absent"}},
+            }
+        )
+
+
+def test_named_tool_choice_matching_well_formed_tool_accepted():
+    request = ChatCompletionRequest.model_validate(
+        {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [WELL_FORMED_TOOL],
+            "tool_choice": NAMED_TOOL_CHOICE,
+        }
+    )
+    assert request.tool_choice.function.name == "get_weather"

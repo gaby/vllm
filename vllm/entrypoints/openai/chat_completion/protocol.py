@@ -59,6 +59,31 @@ _INT64_MIN = -(2**63)
 _INT64_MAX = 2**63 - 1
 
 
+def _unvalidated_tool_name(tool: Any) -> str | None:
+    """Read a tool's function name from a not-yet-validated `tools` entry.
+
+    `mode="before"` validators see the raw request body, so an entry may be
+    any JSON value rather than a `ChatCompletionToolsParam`.
+
+    Args:
+        tool: One element of the raw `tools` value.
+
+    Returns:
+        The function name, or None when the entry does not have the shape
+        Pydantic's field validation will require (which reports it with an
+        exact location).
+    """
+    if isinstance(tool, dict):
+        function = tool.get("function")
+    else:
+        function = getattr(tool, "function", None)
+    if isinstance(function, dict):
+        name = function.get("name")
+    else:
+        name = getattr(function, "name", None)
+    return name if isinstance(name, str) else None
+
+
 class ChatMessage(OpenAIBaseModel):
     role: str
     content: str | None = None
@@ -961,7 +986,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 ' "function": {"name": "my_function"}}`'
             )
             if isinstance(data["tool_choice"], dict):
-                valid_tool = False
                 function = data["tool_choice"].get("function")
                 if not isinstance(function, dict):
                     raise VLLMValidationError(
@@ -982,11 +1006,16 @@ class ChatCompletionRequest(OpenAIBaseModel):
                         f" in `tool_choice`! {correct_usage_message}",
                         parameter="tool_choice.function.name",
                     )
-                for tool in data["tools"]:
-                    if tool["function"]["name"] == function_name:
-                        valid_tool = True
-                        break
-                if not valid_tool:
+                # Tool entries are shape-checked by Pydantic's field
+                # validation, which runs after this one. Read names
+                # defensively and stay quiet when one is unreadable, so the
+                # malformed tool is reported there with its exact location
+                # instead of raising KeyError/TypeError here (HTTP 500).
+                tools = data["tools"]
+                if not isinstance(tools, list):
+                    return data
+                tool_names = [_unvalidated_tool_name(tool) for tool in tools]
+                if None not in tool_names and function_name not in tool_names:
                     raise VLLMValidationError(
                         "The tool specified in `tool_choice` does not match any"
                         " of the specified `tools`",
