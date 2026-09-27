@@ -25,22 +25,32 @@ EOS = 50256  # <|endoftext|> -- the tokenizer's only default stop token
 QUOTE = 1  # standalone `"`; opens then closes the JSON string
 LETTER = 55  # `X`: valid string content, not a special/stop token by default
 
+GLM_TOKENIZER = "zai-org/GLM-4.7"
+GLM_VOCAB_SIZE = 151552
+# generation_config eos ids: <|endoftext|>, <|user|>, <|observation|>. xgrammar
+# only knows <|endoftext|> as a stop token; the other two are plain text to it.
+GLM_STOP_TOKENS = {151329, 151336, 151338}
+
 
 def _token_allowed(row, token_id: int) -> bool:
     word = int(row[token_id // 32].item()) & 0xFFFFFFFF
     return bool(word & (1 << (token_id % 32)))
 
 
-@pytest.fixture(scope="module")
-def backend() -> XgrammarBackend:
+def _make_backend(tokenizer: str, vocab_size: int) -> XgrammarBackend:
     vllm_config = VllmConfig(
         structured_outputs_config=StructuredOutputsConfig(backend="xgrammar")
     )
     return XgrammarBackend(
         vllm_config,
-        tokenizer=AutoTokenizer.from_pretrained(TOKENIZER),
-        vocab_size=VOCAB_SIZE,
+        tokenizer=AutoTokenizer.from_pretrained(tokenizer),
+        vocab_size=vocab_size,
     )
+
+
+@pytest.fixture(scope="module")
+def backend() -> XgrammarBackend:
+    return _make_backend(TOKENIZER, VOCAB_SIZE)
 
 
 def test_request_stop_tokens_gated_to_grammar_terminal(backend: XgrammarBackend):
@@ -80,3 +90,30 @@ def test_request_stop_tokens_gated_to_grammar_terminal(backend: XgrammarBackend)
     assert _token_allowed(bm_override[0], LETTER)
     assert _token_allowed(bm_default[0], EOS)
     assert _token_allowed(bm_override[0], EOS)
+
+
+def test_text_stop_tokens_masked_until_grammar_completes():
+    """GLM ends turns with <|user|>/<|observation|>, which xgrammar treats as
+    text. Mid-grammar the matcher still rejects them as stop tokens, so the
+    mask must exclude them too; sampling one would otherwise fail the request
+    with "Failed to advance FSM".
+    """
+    backend = _make_backend(GLM_TOKENIZER, GLM_VOCAB_SIZE)
+    grammar = backend.compile_grammar(
+        StructuredOutputOptions.JSON,
+        '{"type": "string"}',
+        stop_token_ids=GLM_STOP_TOKENS,
+    )
+    quote = backend.tokenizer.encode('"', add_special_tokens=False)
+    bitmask = backend.allocate_token_bitmask(1)
+
+    assert grammar.accept_tokens("req", quote)
+    grammar.fill_bitmask(bitmask, 0)
+    for token_id in GLM_STOP_TOKENS:
+        assert not grammar.validate_tokens([token_id])
+        assert not _token_allowed(bitmask[0], token_id)
+
+    assert grammar.accept_tokens("req", quote)
+    grammar.fill_bitmask(bitmask, 0)
+    for token_id in GLM_STOP_TOKENS:
+        assert _token_allowed(bitmask[0], token_id)

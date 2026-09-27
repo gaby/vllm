@@ -32,6 +32,12 @@ else:
 logger = init_logger(__name__)
 
 
+def _to_int32(value: int) -> int:
+    """Reinterpret the low 32 bits of ``value`` as a signed int32."""
+    value &= 0xFFFFFFFF
+    return value - (1 << 32) if value & (1 << 31) else value
+
+
 @dataclass
 class XgrammarBackend(StructuredOutputBackend):
     def __post_init__(self):
@@ -122,14 +128,16 @@ class XgrammarBackend(StructuredOutputBackend):
                 f"grammar is not of valid supported types. ({request_type!s})"
             )
 
+        override_stop_tokens = list(stop_token_ids) if stop_token_ids else None
         return XgrammarGrammar(
             matcher=xgr.GrammarMatcher(
                 ctx,
-                override_stop_tokens=list(stop_token_ids) if stop_token_ids else None,
+                override_stop_tokens=override_stop_tokens,
                 max_rollback_tokens=self.num_speculative_tokens,
             ),
             vocab_size=self.vocab_size,
             ctx=ctx,
+            stop_token_ids=override_stop_tokens or [],
         )
 
     def allocate_token_bitmask(self, max_num_seqs: int):
@@ -151,10 +159,26 @@ class XgrammarGrammar(StructuredOutputGrammar):
     vocab_size: int
     matcher: xgr.GrammarMatcher = field(hash=False)
     ctx: xgr.CompiledGrammar = field(hash=False)
+    # The matcher's override_stop_tokens (the request's stop-token ids).
+    stop_token_ids: list[int] = field(default_factory=list, repr=False, hash=False)
     num_processed_tokens: int = field(
         default_factory=lambda: 0, repr=False, hash=False, init=False
     )
     _is_terminated: bool = field(default=False, repr=False, hash=False)
+    # (bitmask word index, int32 AND-mask clearing the stop tokens in it).
+    _stop_token_keep_masks: list[tuple[int, int]] = field(
+        default_factory=list, repr=False, hash=False, init=False
+    )
+
+    def __post_init__(self) -> None:
+        stop_bits: dict[int, int] = {}
+        for token_id in self.stop_token_ids:
+            if 0 <= token_id < self.vocab_size:
+                word, bit = divmod(token_id, 32)
+                stop_bits[word] = stop_bits.get(word, 0) | (1 << bit)
+        self._stop_token_keep_masks = [
+            (word, _to_int32(~bits)) for word, bits in stop_bits.items()
+        ]
 
     def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
         """Accepts a list of tokens and advances the FSM.
@@ -209,6 +233,15 @@ class XgrammarGrammar(StructuredOutputGrammar):
 
     def fill_bitmask(self, bitmask: torch.Tensor, idx: int) -> None:
         self.matcher.fill_next_token_bitmask(bitmask, idx)
+        # xgrammar<0.2.8 leaves override stop tokens that its tokenizer info
+        # does not treat as stop tokens (e.g. GLM's <|user|> and
+        # <|observation|>) in the mask while the grammar cannot terminate,
+        # though accept_token() rejects them there. Sampling one then fails
+        # the request with "Failed to advance FSM".
+        if self._stop_token_keep_masks and not self.matcher.is_completed():
+            row = bitmask[idx].numpy()
+            for word, keep in self._stop_token_keep_masks:
+                row[word] &= keep
 
     def is_terminated(self) -> bool:
         return self._is_terminated
