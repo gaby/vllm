@@ -50,7 +50,10 @@ The following metrics are exposed:
 These metrics are exposed when the `HiSparseConnector` KV connector is
 configured. The host-pool gauges are reported by the scheduler once per engine
 step, for the host pool shared by all tensor-parallel ranks; evictable cached
-blocks count as free.
+blocks count as free. With `--kv-cache-metrics`, the
+`vllm:hisparse_host_block_*_seconds` histograms sample host-pool block
+residency, like the device `vllm:kv_block_*_seconds` histograms, which cover
+only the GPU pool.
 
 --8<-- "gen:metrics-hisparse"
 
@@ -125,6 +128,17 @@ enabled.
     deployments). Long bucket lists inflate Prometheus storage, scrape sizes,
     and query costs. Keep custom lists short, and only override the families
     you actively monitor.
+
+## Grafana Dashboards
+
+vLLM ships [Grafana dashboards](../../examples/observability/dashboards/grafana/README.md)
+for these metrics: a simple status board for the users of a service, a service
+overview with latency SLOs, a per-instance drill-down, and dashboards for the
+KV cache and speculative decoding.
+
+The overview's SLO attainment tiles count requests below a histogram bucket
+boundary, so an SLO threshold that is not a default boundary requires a custom
+bucket list (see above).
 
 ## Deprecation Policy
 
