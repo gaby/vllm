@@ -1871,6 +1871,19 @@ _MASKED_MHA_THRESHOLDS: dict[
 }
 
 
+def _masked_mha_thresholds(
+    backend_name: str, tensor_parallel_size: int, qk_head_dim: int, v_head_dim: int
+) -> tuple[_MaskedMHARanges, _MaskedMHARanges | None] | None:
+    if backend_name == "FLASH_ATTN_MLA_SPARSE_FA4":
+        # Its prefill batches run on FlashInfer's kernel, so it shares those rows.
+        backend_name = "FLASHINFER_MLA_SPARSE"
+    return (
+        _MASKED_MHA_THRESHOLDS.get((qk_head_dim, v_head_dim), {})
+        .get(backend_name, {})
+        .get(tensor_parallel_size)
+    )
+
+
 def _use_masked_mha(
     *,
     backend_name: str,
@@ -1882,17 +1895,12 @@ def _use_masked_mha(
     has_context: bool,
     kv_cache_quantized: bool = False,
 ) -> bool:
-    # Cached context is gathered with a reader that cannot decode quantized
-    # caches; batches without context never touch the cache.
+    # The context gather cannot decode the packed ds_mla layouts and is
+    # unvalidated on plain fp8, so quantized caches qualify only without context.
     if has_context and kv_cache_quantized:
         return False
-    if backend_name == "FLASH_ATTN_MLA_SPARSE_FA4":
-        # Its prefill batches run on FlashInfer's kernel, so it shares those rows.
-        backend_name = "FLASHINFER_MLA_SPARSE"
-    thresholds = (
-        _MASKED_MHA_THRESHOLDS.get((qk_head_dim, v_head_dim), {})
-        .get(backend_name, {})
-        .get(tensor_parallel_size)
+    thresholds = _masked_mha_thresholds(
+        backend_name, tensor_parallel_size, qk_head_dim, v_head_dim
     )
     if thresholds is None:
         return False

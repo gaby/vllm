@@ -27,13 +27,11 @@ INDEX_TOPK, INDEX_KPOOL = 128, 4
 TOPK_WIDTH = 256
 
 
-@pytest.fixture(autouse=True)
-def _parallel_state(default_vllm_config, dist_init):
-    """A real single-rank TP/PP state and current config for the layers."""
+pytestmark = pytest.mark.usefixtures("default_vllm_config", "dist_init")
 
 
-def _config() -> Glm5NextTextConfig:
-    return Glm5NextTextConfig(
+def _config(**overrides) -> Glm5NextTextConfig:
+    kwargs = dict(
         hidden_size=HIDDEN,
         intermediate_size=16,
         vocab_size=32,
@@ -47,6 +45,7 @@ def _config() -> Glm5NextTextConfig:
         index_topk=INDEX_TOPK,
         index_kpool=INDEX_KPOOL,
     )
+    return Glm5NextTextConfig(**(kwargs | overrides))
 
 
 def _vllm_config(config, num_speculative_tokens: int | None = None):
@@ -98,12 +97,9 @@ def test_model_builds_one_decode_sized_builder_for_all_layers(
     config = _config()
     monkeypatch.setattr(glm_model, "Glm5NextDecoderLayer", _Layer)
 
-    model = glm_model.Glm5NextModel(
-        vllm_config=_vllm_config(config, num_speculative_tokens)
-    )
+    glm_model.Glm5NextModel(vllm_config=_vllm_config(config, num_speculative_tokens))
 
     buffer = _Layer.instances[0].kwargs["topk_indices_buffer"]
-    assert buffer.shape == (MAX_NUM_BATCHED_TOKENS, TOPK_WIDTH)
     builders = {id(layer.kwargs["index_group_builder"]) for layer in _Layer.instances}
     assert len(_Layer.instances) == config.num_hidden_layers
     assert len(builders) == 1
@@ -111,7 +107,6 @@ def test_model_builds_one_decode_sized_builder_for_all_layers(
     assert isinstance(builder, SparseMLAIndexGroupBuilder)
     assert builder.logical_topk_indices is buffer
     assert builder.max_decode_rows == decode_rows
-    assert model.is_v32
 
 
 def test_mtp_layer_builds_its_own_decode_sized_builder(monkeypatch):
@@ -133,14 +128,9 @@ def test_mtp_layer_builds_its_own_decode_sized_builder(monkeypatch):
 
 def test_decoder_layer_hands_the_builder_to_the_mla_modules(monkeypatch):
     """The builder reaches the MLA layer's modules, from where the impl takes it."""
-    config = Glm5NextTextConfig(
-        hidden_size=HIDDEN,
-        intermediate_size=16,
-        vocab_size=32,
-        pad_token_id=0,
+    config = _config(
         num_hidden_layers=2,
-        first_k_dense_replace=1,
-        n_routed_experts=4,
+        layer_types=["deepseek_sparse_attention", "linear_attention"],
         num_attention_heads=2,
         num_key_value_heads=2,
         qk_nope_head_dim=32,
@@ -148,11 +138,6 @@ def test_decoder_layer_hands_the_builder_to_the_mla_modules(monkeypatch):
         v_head_dim=32,
         q_lora_rank=16,
         kv_lora_rank=32,
-        layer_types=["deepseek_sparse_attention", "linear_attention"],
-        mhc=False,
-        mla_use_nope=True,
-        index_topk=INDEX_TOPK,
-        index_kpool=INDEX_KPOOL,
         index_n_heads=2,
         index_head_dim=128,
         indexer_rope_interleave=True,

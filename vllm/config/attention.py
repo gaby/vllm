@@ -157,13 +157,13 @@ class AttentionConfig:
     sparse_mla_masked_mha_quantized_kv: bool = False
     """Let sparse MLA prefill batches without cached context use the masked-MHA
     path (SM100 with FlashAttention 4) when the KV cache is quantized (fp8 or
-    nvfp4_ds_mla). That path attends to the new tokens' unquantized K/V rather
-    than the dequantized cache, and avoids both the cache upconversion and the
-    head padding that makes sparse MQA prefill costlier as the tensor-parallel
-    size grows. Batches with cached context still use the sparse MQA path. Only
-    backends and tensor-parallel sizes with a masked-MHA route are affected;
-    elsewhere the flag is ignored but still reserves the 128 MiB top-k mask
-    workspace per attention metadata builder."""
+    nvfp4_ds_mla). Like the dense-MHA prefill of prompts up to `index_topk`
+    tokens, that path attends to the new tokens' unquantized K/V rather than the
+    cache; on FLASHMLA_SPARSE it also avoids the cache upconversion and the head
+    padding that make sparse MQA prefill costlier as the tensor-parallel size
+    grows. Batches with cached context are unaffected. Only backends and
+    tensor-parallel sizes with a masked-MHA route are affected, and the routing
+    thresholds were measured on unquantized caches."""
 
     sparse_mla_prefill_workspace_factor: int | None = Field(default=None, ge=2)
     """Sparse MLA prefill workspace size, in multiples of `max_model_len`.

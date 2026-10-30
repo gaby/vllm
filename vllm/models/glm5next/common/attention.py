@@ -309,7 +309,7 @@ class Indexer(nn.Module):
         fp32 matmul of the upcast operands, without the fp32 copy of the input.
         """
         weight = self.wk_weights_proj.weight[self.head_dim :]
-        if self._fp32_out_gate_gemm and hidden_states.dtype == weight.dtype:
+        if self._fp32_out_gate_gemm:
             return torch.mm(hidden_states, weight.t(), out_dtype=torch.float32)
         return torch.mm(hidden_states.float(), weight.float().t())
 

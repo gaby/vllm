@@ -711,7 +711,6 @@ class Dots3NotePaddedSparseBackend(FlashAttnMLASparseBackend):
 class Dots3NotePaddedSparseImpl(FlashAttnMLASparseImpl):
     """Read top-k KV directly from uniformly padded cache rows."""
 
-    # forward_mqa converts the top-k indices inline.
     uses_index_group: ClassVar[bool] = False
 
     def _logical_cache(self, kv_cache: torch.Tensor) -> torch.Tensor:

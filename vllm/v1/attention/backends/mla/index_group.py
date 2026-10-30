@@ -354,6 +354,7 @@ class SparseMLAIndexGroupBuilder:
             else max_decode_rows
         )
         self.current_group: SparseMLAIndexGroup | None = None
+        self.current_kv_cache_dtype: str | None = None
 
     def skip_index_producing_layer(self) -> None:
         """Note an index-producing layer that joins no group.
@@ -371,7 +372,14 @@ class SparseMLAIndexGroupBuilder:
         row_width: int | None = None,
         kv_cache_dtype: str | None = None,
     ) -> tuple[SparseMLAIndexGroup, int]:
-        if is_index_producing_layer or self.current_group is None:
+        # Followers read the rows their leader converted, so they must route and
+        # convert each batch alike; another KV cache dtype can change both.
+        if (
+            is_index_producing_layer
+            or self.current_group is None
+            or kv_cache_dtype != self.current_kv_cache_dtype
+        ):
+            self.current_kv_cache_dtype = kv_cache_dtype
             group_cls = (
                 HiSparseMLAIndexGroup
                 if vllm_config is not None

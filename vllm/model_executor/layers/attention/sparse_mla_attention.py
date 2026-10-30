@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 from vllm import _custom_ops as ops
-from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
+from vllm.config import get_current_vllm_config
 from vllm.distributed import (
     get_dcp_group,
     get_tensor_model_parallel_world_size,
@@ -22,6 +22,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonDecodeMetadata,
     MLACommonMetadata,
     MLACommonPrefillMetadata,
+    _masked_mha_thresholds,
     accumulate_mla_context_chunk,
     align_mla_chunked_context_workspace_size,
     build_mla_chunked_context_metadata,
@@ -232,6 +233,10 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
             dtype=self.model_config.dtype,
             device=device,
         )
+        attention_layer = vllm_config.compilation_config.static_forward_context[
+            layer_names[0]
+        ]
+        cache_dtype = vllm_config.cache_config.cache_dtype
         self.topk_mask_workspace: torch.Tensor | None = None
         if _is_masked_mha_available(
             self.model_config.model_arch_config.total_num_attention_heads,
@@ -239,17 +244,24 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
             self.mla_dims.qk_nope_head_dim,
             self.mla_dims.qk_rope_head_dim,
             self.mla_dims.v_head_dim,
-            vllm_config.cache_config.cache_dtype,
+            cache_dtype,
             vllm_config.attention_config.sparse_mla_masked_mha_quantized_kv,
+        ) and (
+            # The quantized-KV opt-in reserves the mask only where it can route.
+            not is_quantized_kv_cache(cache_dtype)
+            or _masked_mha_thresholds(
+                attention_layer.get_attn_backend().get_name(),
+                parallel_config.tensor_parallel_size,
+                self.mla_dims.qk_nope_head_dim + self.mla_dims.qk_rope_head_dim,
+                self.mla_dims.v_head_dim,
+            )
+            is not None
         ):
             self.topk_mask_workspace = torch.zeros(
                 GLOBAL_TOPK_MASK_MAX_BYTES // torch.int32.itemsize,
                 dtype=torch.int32,
                 device=device,
             )
-        attention_layer = vllm_config.compilation_config.static_forward_context[
-            layer_names[0]
-        ]
         layer_prefill_backend = attention_layer.prefill_backend
         self.dcp_manager: MLADCPManager | None = None
         if self.dcp_world_size > 1:
@@ -647,8 +659,8 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
     # Reuse the index group's top-k conversion only for uniform decode batches
     # of multi-layer groups; other batches convert per layer.
     group_conversion_decode_only: ClassVar[bool] = False
-    # Backends whose forward_mqa converts top-k indices itself opt out, so no
-    # index-group workspace is allocated for their layers.
+    # Backends whose forward_mqa converts top-k indices itself opt out of the
+    # index-group workspace; under HiSparse every layer still joins a group.
     uses_index_group: ClassVar[bool] = True
 
     def __init__(
@@ -692,10 +704,10 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
         self.init_topk_indices_buffer(indexer, topk_indices_buffer)
         self.index_group: SparseMLAIndexGroup | None = None
         self.index_group_index = 0
+        vllm_config = get_current_vllm_config()
         if index_group_builder is None and self.topk_indices_buffer is not None:
             index_group_builder = SparseMLAIndexGroupBuilder(self.topk_indices_buffer)
         if index_group_builder is not None:
-            vllm_config = get_current_vllm_config()
             if (
                 self.uses_index_group
                 or vllm_config.attention_config.hisparse_config is not None
@@ -722,7 +734,6 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
             and (self.qk_nope_head_dim == 128)
             and (self.qk_rope_head_dim == 64)
         )
-        current_config = get_current_vllm_config_or_none()
         self.masked_mha_available = _is_masked_mha_available(
             num_heads_total=num_heads * get_tensor_model_parallel_world_size(),
             kv_lora_rank=kv_lora_rank,
@@ -731,8 +742,7 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
             v_head_dim=v_head_dim,
             kv_cache_dtype=kv_cache_dtype,
             allow_quantized_kv=(
-                current_config is not None
-                and current_config.attention_config.sparse_mla_masked_mha_quantized_kv
+                vllm_config.attention_config.sparse_mla_masked_mha_quantized_kv
             ),
         )
 

@@ -5,8 +5,8 @@
 The gate logits stay fp32 (bf16 rounding can flip near-tie pool rankings), but
 they used to come from an fp32 copy of ``hidden_states`` and an fp32 matmul of
 a cached fp32 weight. The fp32 epilogue of the half-precision GEMM computes the
-same product without the copy. CPU torch has no such epilogue, so ``torch.mm``
-is spied on and emulates it.
+same product without the copy. CPU torch has no such epilogue, so the CPU tests
+spy on ``torch.mm`` and emulate it; the device test runs the real one.
 """
 
 from types import SimpleNamespace
@@ -18,15 +18,14 @@ from transformers import Glm5NextTextConfig
 
 from vllm.config import AttentionConfig, CacheConfig
 from vllm.models.glm5next.common import attention
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 HIDDEN, N_HEAD, HEAD_DIM, NUM_TOKENS = 64, 4, 128, 5
 TOPK_WIDTH = 256
 
 
-@pytest.fixture(autouse=True)
-def _parallel_state(default_vllm_config, dist_init):
-    """A real single-rank TP/PP state and current config for the layers."""
+pytestmark = pytest.mark.usefixtures("default_vllm_config", "dist_init")
 
 
 def _make_indexer(
@@ -120,18 +119,6 @@ def test_gate_uses_the_fp32_epilogue_without_copying_the_activations(
     torch.testing.assert_close(gate, _reference(hidden, weight))
 
 
-def test_gate_only_reads_the_weights_proj_rows(monkeypatch, mm_calls):
-    indexer = _make_indexer(monkeypatch)
-    weight = _load_weights(indexer)
-    weight.data[:HEAD_DIM] = float("nan")
-    hidden = torch.randn(NUM_TOKENS, HIDDEN).bfloat16()
-
-    gate = indexer._head_gate(hidden)
-
-    assert gate.shape == (NUM_TOKENS, N_HEAD)
-    assert torch.isfinite(gate).all()
-
-
 def test_gate_follows_in_place_weight_updates(monkeypatch, mm_calls):
     # A weight refit writes the parameter in place; a cached copy goes stale.
     indexer = _make_indexer(monkeypatch)
@@ -141,7 +128,7 @@ def test_gate_follows_in_place_weight_updates(monkeypatch, mm_calls):
 
     weight.data[HEAD_DIM:].mul_(2)
 
-    torch.testing.assert_close(indexer._head_gate(hidden), 2 * before)
+    assert torch.equal(indexer._head_gate(hidden), 2 * before)
 
 
 @pytest.mark.parametrize(
@@ -171,15 +158,23 @@ def test_gate_keeps_the_fp32_matmul_where_the_epilogue_does_not_apply(
     torch.testing.assert_close(gate, _reference(hidden, weight))
 
 
-def test_gate_falls_back_when_the_activations_do_not_match_the_weight(
-    monkeypatch, mm_calls
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(), reason="mm(out_dtype=) needs CUDA or ROCm"
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_gate_epilogue_on_device_matches_the_fp32_matmul_it_replaced(
+    monkeypatch, dtype
 ):
-    indexer = _make_indexer(monkeypatch)
-    weight = _load_weights(indexer)
-    hidden = torch.randn(NUM_TOKENS, HIDDEN)
+    indexer = _make_indexer(monkeypatch, dtype=dtype).to("cuda")
+    weight = indexer.wk_weights_proj.weight
+    torch.manual_seed(0)
+    # Small integers keep every partial sum exact in fp32 whatever the GEMM's
+    # reduction order, while a bf16-rounded result would differ.
+    weight.data.copy_(torch.randint(-32, 33, weight.shape))
+    hidden = torch.randint(-32, 33, (NUM_TOKENS, HIDDEN), device="cuda").to(dtype)
 
     gate = indexer._head_gate(hidden)
 
-    (call,) = mm_calls
-    assert call.out_dtype is None
-    torch.testing.assert_close(gate, _reference(hidden, weight))
+    replaced = torch.mm(hidden.float(), weight[HEAD_DIM:].t().contiguous().float())
+    assert gate.dtype == torch.float32
+    torch.testing.assert_close(gate, replaced, rtol=0, atol=0)

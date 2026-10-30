@@ -36,7 +36,6 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
 
     is_sparse = True
     supports_dense_mha_prefill = False
-    # forward_mqa converts the top-k indices inline unless HiSparse is on.
     uses_index_group: ClassVar[bool] = False
 
     def get_fp8_ds_mla_row_bytes(self) -> int:
