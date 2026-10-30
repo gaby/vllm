@@ -712,6 +712,8 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
                         kv_cache_dtype=kv_cache_dtype,
                     )
                 )
+            elif indexer is not None:
+                index_group_builder.skip_index_producing_layer()
 
         self._use_flashinfer_concat_mla_k = (
             has_flashinfer()

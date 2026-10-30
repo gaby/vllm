@@ -355,6 +355,14 @@ class SparseMLAIndexGroupBuilder:
         )
         self.current_group: SparseMLAIndexGroup | None = None
 
+    def skip_index_producing_layer(self) -> None:
+        """Note an index-producing layer that joins no group.
+
+        Its indices replace the shared buffer's, so later layers must not join
+        the current group, whose conversion was made from the previous indices.
+        """
+        self.current_group = None
+
     def register_layer(
         self,
         is_index_producing_layer: bool,

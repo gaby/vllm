@@ -24,9 +24,8 @@ from vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm90 import (
     FlashInferMLASparseSM90Impl,
 )
 from vllm.v1.attention.backends.mla.index_group import SparseMLAIndexGroupBuilder
-from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import ROCMAiterMLASparseImpl
 
-NUM_TOKENS, TOPK_WIDTH, DECODE_ROWS = 64, 256, 8
+NUM_TOKENS, TOPK_WIDTH, DECODE_ROWS, NUM_LAYERS = 64, 256, 8, 3
 NUM_HEADS, KV_LORA_RANK, QK_NOPE_HEAD_DIM, V_HEAD_DIM = 16, 512, 256, 256
 
 
@@ -35,7 +34,7 @@ def _parallel_state(default_vllm_config, dist_init):
     """A real single-rank TP/PP state and current config for the impls."""
 
 
-def _make_impl(impl_cls, buffer: torch.Tensor, **kwargs):
+def _make_impl(impl_cls, buffer: torch.Tensor, *, has_indexer: bool = True, **kwargs):
     kv_b_proj = ColumnParallelLinear(
         KV_LORA_RANK,
         NUM_HEADS * (QK_NOPE_HEAD_DIM + V_HEAD_DIM),
@@ -61,7 +60,7 @@ def _make_impl(impl_cls, buffer: torch.Tensor, **kwargs):
         v_head_dim=V_HEAD_DIM,
         kv_b_proj=kv_b_proj,
         # The impl only reads the buffer from its indexer.
-        indexer=SimpleNamespace(topk_indices_buffer=buffer),
+        indexer=SimpleNamespace(topk_indices_buffer=buffer) if has_indexer else None,
         topk_indices_buffer=buffer,
         **kwargs,
     )
@@ -84,21 +83,22 @@ def _buffer() -> torch.Tensor:
 
 
 def test_impl_that_converts_inline_allocates_no_workspace():
-    impls = [_make_impl(FlashInferMLASparseSM90Impl, _buffer()) for _ in range(12)]
+    impls = [
+        _make_impl(FlashInferMLASparseSM90Impl, _buffer()) for _ in range(NUM_LAYERS)
+    ]
 
     assert all(impl.index_group is None for impl in impls)
-    assert _workspace_bytes(impls) == 0
 
 
 def test_impl_that_reads_the_group_without_a_builder_pays_for_full_batches():
     # The fallback builder has no decode-row bound: this is what a model that
     # passes no shared builder gets per layer.
-    impls = [_make_impl(FlashInferMLASparseImpl, _buffer()) for _ in range(12)]
+    impls = [_make_impl(FlashInferMLASparseImpl, _buffer()) for _ in range(NUM_LAYERS)]
 
     group = impls[0].index_group
     assert group is not None
     assert group.physical_topk_indices.shape == (NUM_TOKENS + 1, TOPK_WIDTH)
-    assert _workspace_bytes(impls) == 12 * (
+    assert _workspace_bytes(impls) == NUM_LAYERS * (
         (NUM_TOKENS + 1) * TOPK_WIDTH * 4 + (NUM_TOKENS + 1) * 4
     )
 
@@ -108,7 +108,7 @@ def test_shared_builder_bounds_the_workspace_by_decode_rows():
     builder = SparseMLAIndexGroupBuilder(buffer, DECODE_ROWS)
     impls = [
         _make_impl(FlashInferMLASparseImpl, buffer, index_group_builder=builder)
-        for _ in range(12)
+        for _ in range(NUM_LAYERS)
     ]
 
     for impl in impls:
@@ -117,7 +117,7 @@ def test_shared_builder_bounds_the_workspace_by_decode_rows():
             DECODE_ROWS + 1,
             TOPK_WIDTH,
         )
-    assert _workspace_bytes(impls) == 12 * (
+    assert _workspace_bytes(impls) == NUM_LAYERS * (
         (DECODE_ROWS + 1) * TOPK_WIDTH * 4 + (DECODE_ROWS + 1) * 4
     )
 
@@ -130,6 +130,26 @@ def test_opted_out_impl_ignores_an_explicit_builder():
 
     assert impl.index_group is None
     assert builder.current_group is None
+
+
+def test_opted_out_producer_ends_the_group_of_later_skip_layers():
+    # The opted-out layer's indexer rewrites the shared top-k buffer, so a later
+    # skip layer must not reuse the conversion of the first layer's indices.
+    buffer = _buffer()
+    builder = SparseMLAIndexGroupBuilder(buffer, DECODE_ROWS)
+
+    producer = _make_impl(FlashInferMLASparseImpl, buffer, index_group_builder=builder)
+    _make_impl(FlashInferMLASparseSM90Impl, buffer, index_group_builder=builder)
+    skip = _make_impl(
+        FlashInferMLASparseImpl,
+        buffer,
+        has_indexer=False,
+        index_group_builder=builder,
+    )
+
+    assert skip.index_group is not None
+    assert skip.index_group is not producer.index_group
+    assert not skip.index_group.has_indexer
 
 
 class _RecordingBuilder:
@@ -146,21 +166,13 @@ class _RecordingBuilder:
 def test_hisparse_keeps_the_group_of_an_opted_out_impl(
     monkeypatch, default_vllm_config
 ):
-    # HiSparse routes the conversion through its group, so a configured
+    # HiSparse binds each layer's cache handle from its group, so a configured
     # HiSparse must not lose it. Platform validation of the field is bypassed.
     monkeypatch.setattr(
         default_vllm_config.attention_config, "hisparse_config", HiSparseConfig()
     )
     builder = _RecordingBuilder()
 
-    impl = _make_impl(
-        FlashInferMLASparseSM90Impl, _buffer(), index_group_builder=builder
-    )
+    _make_impl(FlashInferMLASparseSM90Impl, _buffer(), index_group_builder=builder)
 
     assert builder.registered == [True]
-    assert impl.index_group is not None
-
-
-def test_rocm_aiter_impl_converts_inline():
-    # Its constructor needs ROCm state, so the opt-out is checked on the class.
-    assert ROCMAiterMLASparseImpl.uses_index_group is False

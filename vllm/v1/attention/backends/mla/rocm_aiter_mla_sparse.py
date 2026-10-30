@@ -871,11 +871,6 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
             return "context parallelism is not supported"
         return None
 
-    def record_logical_topk_ready(self) -> None:
-        # This impl shares the top-k indices buffer via SharedTopkIndicesBuffer
-        # but does not participate in sparse-MLA index groups.
-        pass
-
     def _forward_mla(
         self,
         layer: AttentionLayer,
