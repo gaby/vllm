@@ -255,8 +255,7 @@ class Indexer(nn.Module):
         self.quant_block_size = 128  # TODO: get from config
         self.topk_indices_buffer = topk_indices_buffer
         # The fp32-epilogue GEMM (``mm(out_dtype=)``) needs half-precision
-        # operands; batch-invariant mode keeps the fp32 matmul its ``mm``
-        # override covers.
+        # operands; batch-invariant mode keeps the plain fp32 matmul.
         self._fp32_out_gate_gemm = (
             current_platform.is_cuda_alike()
             and not envs.VLLM_BATCH_INVARIANT
@@ -312,7 +311,7 @@ class Indexer(nn.Module):
         weight = self.wk_weights_proj.weight[self.head_dim :]
         if self._fp32_out_gate_gemm and hidden_states.dtype == weight.dtype:
             return torch.mm(hidden_states, weight.t(), out_dtype=torch.float32)
-        return torch.mm(hidden_states.float(), weight.t().contiguous().float())
+        return torch.mm(hidden_states.float(), weight.float().t())
 
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb

@@ -13,6 +13,8 @@ import torch
 from torch import nn
 from transformers import Glm5NextTextConfig
 
+from vllm.config import AttentionConfig, CacheConfig
+from vllm.models.glm5next.common import attention as glm_attention
 from vllm.models.glm5next.common import model as glm_model
 from vllm.models.glm5next.common import mtp as glm_mtp
 from vllm.v1.attention.backends.mla.index_group import SparseMLAIndexGroupBuilder
@@ -129,25 +131,54 @@ def test_mtp_layer_builds_its_own_decode_sized_builder(monkeypatch):
     assert builder.max_decode_rows == MAX_NUM_SEQS * 4
 
 
-def test_decoder_layer_hands_the_builder_to_the_mla_layer(monkeypatch):
-    config = _config()
-    attention_kwargs: dict = {}
+def test_decoder_layer_hands_the_builder_to_the_mla_modules(monkeypatch):
+    """The builder reaches the MLA layer's modules, from where the impl takes it."""
+    config = Glm5NextTextConfig(
+        hidden_size=HIDDEN,
+        intermediate_size=16,
+        vocab_size=32,
+        pad_token_id=0,
+        num_hidden_layers=2,
+        first_k_dense_replace=1,
+        n_routed_experts=4,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        qk_nope_head_dim=32,
+        qk_rope_head_dim=0,
+        v_head_dim=32,
+        q_lora_rank=16,
+        kv_lora_rank=32,
+        layer_types=["deepseek_sparse_attention", "linear_attention"],
+        mhc=False,
+        mla_use_nope=True,
+        index_topk=INDEX_TOPK,
+        index_kpool=INDEX_KPOOL,
+        index_n_heads=2,
+        index_head_dim=128,
+        indexer_rope_interleave=True,
+    )
+    mla_modules = []
 
-    class _Attention(nn.Module):
-        """MLA layer stand-in: the real one needs a GPU attention backend."""
+    class _Wrapper(nn.Module):
+        """MLA wrapper stand-in: the real one needs a GPU attention backend."""
 
         def __init__(self, *args, **kwargs) -> None:
             super().__init__()
-            attention_kwargs.update(kwargs)
-            self.o_proj = SimpleNamespace(reduce_results=True)
+            mla_modules.append(args[8])
 
-    monkeypatch.setattr(glm_model, "Glm5NextMLAAttention", _Attention)
+    monkeypatch.setattr(glm_attention, "MultiHeadLatentAttentionWrapper", _Wrapper)
+    # The top-k op needs DeepGEMM or AITER kernels and plays no part here.
+    monkeypatch.setattr(
+        glm_attention, "SparseAttnIndexerKpool", lambda *a, **k: nn.Module()
+    )
     builder = SparseMLAIndexGroupBuilder(torch.empty(1, TOPK_WIDTH, dtype=torch.int32))
 
     glm_model.Glm5NextDecoderLayer(
         SimpleNamespace(
-            cache_config=None,
+            cache_config=CacheConfig(),
             quant_config=None,
+            model_config=SimpleNamespace(max_model_len=1024, dtype=torch.bfloat16),
+            attention_config=AttentionConfig(sparse_mla_prefill_workspace_factor=5),
             parallel_config=SimpleNamespace(use_sequence_parallel_moe=False),
             kernel_config=SimpleNamespace(enable_jit_warmup=False),
         ),
@@ -157,4 +188,5 @@ def test_decoder_layer_hands_the_builder_to_the_mla_layer(monkeypatch):
         index_group_builder=builder,
     )
 
-    assert attention_kwargs["index_group_builder"] is builder
+    (modules,) = mla_modules
+    assert modules.index_group_builder is builder
