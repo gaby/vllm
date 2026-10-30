@@ -639,6 +639,9 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
     # Reuse the index group's top-k conversion only for uniform decode batches
     # of multi-layer groups; other batches convert per layer.
     group_conversion_decode_only: ClassVar[bool] = False
+    # Backends whose forward_mqa converts top-k indices itself opt out, so no
+    # index-group workspace is allocated for their layers.
+    uses_index_group: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -685,18 +688,22 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
             index_group_builder = SparseMLAIndexGroupBuilder(self.topk_indices_buffer)
         if index_group_builder is not None:
             vllm_config = get_current_vllm_config()
-            self.index_group, self.index_group_index = (
-                index_group_builder.register_layer(
-                    indexer is not None,
-                    vllm_config,
-                    row_width=(
-                        self.get_fp8_ds_mla_row_bytes()
-                        if kv_cache_dtype == "fp8_ds_mla"
-                        else head_size
-                    ),
-                    kv_cache_dtype=kv_cache_dtype,
+            if (
+                self.uses_index_group
+                or vllm_config.attention_config.hisparse_config is not None
+            ):
+                self.index_group, self.index_group_index = (
+                    index_group_builder.register_layer(
+                        indexer is not None,
+                        vllm_config,
+                        row_width=(
+                            self.get_fp8_ds_mla_row_bytes()
+                            if kv_cache_dtype == "fp8_ds_mla"
+                            else head_size
+                        ),
+                        kv_cache_dtype=kv_cache_dtype,
+                    )
                 )
-            )
 
         self._use_flashinfer_concat_mla_k = (
             has_flashinfer()

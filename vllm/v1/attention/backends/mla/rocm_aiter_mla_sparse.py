@@ -779,6 +779,8 @@ def reference_mla_sparse_prefill(
 class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
     supports_dcp = False
     use_aiter_sparse_mla = False
+    # forward_mqa remaps the top-k indices itself.
+    uses_index_group: ClassVar[bool] = False
 
     def __init__(
         self,
