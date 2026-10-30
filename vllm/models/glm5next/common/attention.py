@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import Glm5NextTextConfig
 
+import vllm.envs as envs
 from vllm.config import (
     CacheConfig,
     VllmConfig,
@@ -34,6 +35,7 @@ from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
 from vllm.models.glm5next.sparse_indexer import SparseAttnIndexerKpool
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv, next_power_of_2
+from vllm.v1.attention.backends.mla.index_group import SparseMLAIndexGroupBuilder
 from vllm.v1.attention.backends.mla.indexer import Glm5NextIndexerBackend
 from vllm.v1.kv_cache_interface import CircularBufferSpec, MLAAttentionSpec
 
@@ -252,7 +254,13 @@ class Indexer(nn.Module):
         self.scale_fmt = "ue8m0"
         self.quant_block_size = 128  # TODO: get from config
         self.topk_indices_buffer = topk_indices_buffer
-        self._wp_fp32: torch.Tensor | None = None
+        # The fp32-epilogue GEMM (``mm(out_dtype=)``) needs half-precision
+        # operands; batch-invariant mode keeps the plain fp32 matmul.
+        self._fp32_out_gate_gemm = (
+            current_platform.is_cuda_alike()
+            and not envs.VLLM_BATCH_INVARIANT
+            and vllm_config.model_config.dtype in (torch.bfloat16, torch.float16)
+        )
 
         # NOTE: (zyongye) we use fp8 naive cache,
         #       where we store value in fp8 and scale in fp32
@@ -294,6 +302,17 @@ class Indexer(nn.Module):
             tail_cache=self.tail_cache,
         )
 
+    def _head_gate(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """fp32 head-gate logits from the ``weights_proj`` rows of ``wk_weights_proj``.
+
+        Half-precision products are exact in fp32, so the fp32 epilogue equals an
+        fp32 matmul of the upcast operands, without the fp32 copy of the input.
+        """
+        weight = self.wk_weights_proj.weight[self.head_dim :]
+        if self._fp32_out_gate_gemm:
+            return torch.mm(hidden_states, weight.t(), out_dtype=torch.float32)
+        return torch.mm(hidden_states.float(), weight.float().t())
+
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
     ) -> torch.Tensor:
@@ -301,17 +320,10 @@ class Indexer(nn.Module):
         q = q.view(-1, self.n_head, self.head_dim)
 
         # Compute the head gate in fp32; bf16 error can change near-tie pool
-        # rankings on long-context tasks. Cache it after weights are loaded.
+        # rankings on long-context tasks.
         kw, _ = self.wk_weights_proj(hidden_states)
         k = kw[:, : self.head_dim]
-        if self._wp_fp32 is None:
-            self._wp_fp32 = (
-                self.wk_weights_proj.weight.data[self.head_dim :, :]
-                .t()
-                .contiguous()
-                .float()
-            )
-        weights = torch.mm(hidden_states.float(), self._wp_fp32)
+        weights = self._head_gate(hidden_states)
 
         k = _fused_indexer_k_norm(
             k, self.k_norm.weight, self.k_norm.bias, self.head_dim, self.k_norm.eps
@@ -401,6 +413,7 @@ class Glm5NextMLAAttention(nn.Module):
         topk_indices_buffer: torch.Tensor | None = None,
         input_size: int | None = None,
         skip_rope: bool | None = False,
+        index_group_builder: SparseMLAIndexGroupBuilder | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -549,6 +562,7 @@ class Glm5NextMLAAttention(nn.Module):
             indexer_rotary_emb=self.indexer_rope_emb,
             is_sparse=self.is_v32,
             topk_indices_buffer=topk_indices_buffer,
+            index_group_builder=index_group_builder,
         )
 
         self.mla_attn = MultiHeadLatentAttentionWrapper(

@@ -70,7 +70,9 @@ def _patch_init_deps(monkeypatch, *, speculative: bool = False):
         scheduler_config=SimpleNamespace(max_num_batched_tokens=NUM_TOKENS),
         model_config=SimpleNamespace(dtype=torch.bfloat16),
         speculative_config=SimpleNamespace() if speculative else None,
-        attention_config=SimpleNamespace(hisparse_config=None),
+        attention_config=SimpleNamespace(
+            hisparse_config=None, sparse_mla_masked_mha_quantized_kv=False
+        ),
     )
     monkeypatch.setattr(sparse_mod, "get_current_vllm_config", lambda: vllm_config)
     monkeypatch.setattr(sparse_mla_mod, "get_current_vllm_config", lambda: vllm_config)
