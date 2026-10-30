@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 from vllm import _custom_ops as ops
-from vllm.config import get_current_vllm_config
+from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
 from vllm.distributed import (
     get_dcp_group,
     get_tensor_model_parallel_world_size,
@@ -103,8 +103,13 @@ def _is_masked_mha_available(
     qk_rope_head_dim: int,
     v_head_dim: int,
     kv_cache_dtype: str,
+    allow_quantized_kv: bool = False,
 ) -> bool:
-    """Check if masked MHA can ever fire for this model configuration."""
+    """Check if masked MHA can ever fire for this model configuration.
+
+    A quantized KV cache qualifies only when ``allow_quantized_kv`` is set; the
+    caller then keeps masked MHA to batches without cached context.
+    """
     if not current_platform.is_device_capability_family(100):
         return False
     model_dims = (
@@ -130,7 +135,9 @@ def _is_masked_mha_available(
         fa_version = get_flash_attn_version(
             head_size=qk_head_dim, head_size_v=v_head_dim
         )
-    return fa_version == 4 and not is_quantized_kv_cache(kv_cache_dtype)
+    return fa_version == 4 and (
+        allow_quantized_kv or not is_quantized_kv_cache(kv_cache_dtype)
+    )
 
 
 def _use_dense_mha_prefill(
@@ -233,6 +240,7 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
             self.mla_dims.qk_rope_head_dim,
             self.mla_dims.v_head_dim,
             vllm_config.cache_config.cache_dtype,
+            vllm_config.attention_config.sparse_mla_masked_mha_quantized_kv,
         ):
             self.topk_mask_workspace = torch.zeros(
                 GLOBAL_TOPK_MASK_MAX_BYTES // torch.int32.itemsize,
@@ -712,6 +720,7 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
             and (self.qk_nope_head_dim == 128)
             and (self.qk_rope_head_dim == 64)
         )
+        current_config = get_current_vllm_config_or_none()
         self.masked_mha_available = _is_masked_mha_available(
             num_heads_total=num_heads * get_tensor_model_parallel_world_size(),
             kv_lora_rank=kv_lora_rank,
@@ -719,6 +728,10 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
             qk_rope_head_dim=qk_rope_head_dim,
             v_head_dim=v_head_dim,
             kv_cache_dtype=kv_cache_dtype,
+            allow_quantized_kv=(
+                current_config is not None
+                and current_config.attention_config.sparse_mla_masked_mha_quantized_kv
+            ),
         )
 
     def record_logical_topk_ready(self) -> None:

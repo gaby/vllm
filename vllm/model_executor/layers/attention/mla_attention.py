@@ -1232,6 +1232,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 query_len=prefill.max_query_len,
                 seq_len=attn_metadata.prefill_max_seq_len,  # type: ignore[attr-defined]
                 has_context=prefill.chunked_context is not None,
+                kv_cache_quantized=is_quantized_kv_cache(self.kv_cache_dtype),
             )
             and self.impl.masked_mha_workspace_fits(prefill)  # type: ignore[attr-defined]
         )
@@ -1879,7 +1880,12 @@ def _use_masked_mha(
     query_len: int,
     seq_len: int,
     has_context: bool,
+    kv_cache_quantized: bool = False,
 ) -> bool:
+    # Cached context is gathered with a reader that cannot decode quantized
+    # caches; batches without context never touch the cache.
+    if has_context and kv_cache_quantized:
+        return False
     if backend_name == "FLASH_ATTN_MLA_SPARSE_FA4":
         # Its prefill batches run on FlashInfer's kernel, so it shares those rows.
         backend_name = "FLASHINFER_MLA_SPARSE"
