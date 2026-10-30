@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import Glm5NextTextConfig
 
+import vllm.envs as envs
 from vllm.config import (
     CacheConfig,
     VllmConfig,
@@ -253,7 +254,14 @@ class Indexer(nn.Module):
         self.scale_fmt = "ue8m0"
         self.quant_block_size = 128  # TODO: get from config
         self.topk_indices_buffer = topk_indices_buffer
-        self._wp_fp32: torch.Tensor | None = None
+        # The fp32-epilogue GEMM (``mm(out_dtype=)``) needs half-precision
+        # operands; batch-invariant mode keeps the fp32 matmul its ``mm``
+        # override covers.
+        self._fp32_out_gate_gemm = (
+            current_platform.is_cuda_alike()
+            and not envs.VLLM_BATCH_INVARIANT
+            and vllm_config.model_config.dtype in (torch.bfloat16, torch.float16)
+        )
 
         # NOTE: (zyongye) we use fp8 naive cache,
         #       where we store value in fp8 and scale in fp32
@@ -295,6 +303,17 @@ class Indexer(nn.Module):
             tail_cache=self.tail_cache,
         )
 
+    def _head_gate(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """fp32 head-gate logits from the ``weights_proj`` rows of ``wk_weights_proj``.
+
+        Half-precision products are exact in fp32, so the fp32 epilogue equals an
+        fp32 matmul of the upcast operands, without the fp32 copy of the input.
+        """
+        weight = self.wk_weights_proj.weight[self.head_dim :]
+        if self._fp32_out_gate_gemm and hidden_states.dtype == weight.dtype:
+            return torch.mm(hidden_states, weight.t(), out_dtype=torch.float32)
+        return torch.mm(hidden_states.float(), weight.t().contiguous().float())
+
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
     ) -> torch.Tensor:
@@ -302,17 +321,10 @@ class Indexer(nn.Module):
         q = q.view(-1, self.n_head, self.head_dim)
 
         # Compute the head gate in fp32; bf16 error can change near-tie pool
-        # rankings on long-context tasks. Cache it after weights are loaded.
+        # rankings on long-context tasks.
         kw, _ = self.wk_weights_proj(hidden_states)
         k = kw[:, : self.head_dim]
-        if self._wp_fp32 is None:
-            self._wp_fp32 = (
-                self.wk_weights_proj.weight.data[self.head_dim :, :]
-                .t()
-                .contiguous()
-                .float()
-            )
-        weights = torch.mm(hidden_states.float(), self._wp_fp32)
+        weights = self._head_gate(hidden_states)
 
         k = _fused_indexer_k_norm(
             k, self.k_norm.weight, self.k_norm.bias, self.head_dim, self.k_norm.eps
