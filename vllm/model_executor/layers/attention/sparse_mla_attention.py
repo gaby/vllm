@@ -1097,6 +1097,9 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
                 "Masked MHA with context does not yet support decode context "
                 "parallelism"
             )
+        assert self.kv_cache_dtype not in ("fp8_ds_mla", "nvfp4_ds_mla"), (
+            f"gather_and_maybe_dequant_cache cannot decode {self.kv_cache_dtype}"
+        )
 
         chunked_context = prefill_metadata.chunked_context
         assert chunked_context is not None

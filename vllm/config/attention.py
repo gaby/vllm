@@ -160,7 +160,10 @@ class AttentionConfig:
     nvfp4_ds_mla). That path attends to the new tokens' unquantized K/V rather
     than the dequantized cache, and avoids both the cache upconversion and the
     head padding that makes sparse MQA prefill costlier as the tensor-parallel
-    size grows. Batches with cached context still use the sparse MQA path."""
+    size grows. Batches with cached context still use the sparse MQA path. Only
+    backends and tensor-parallel sizes with a masked-MHA route are affected;
+    elsewhere the flag is ignored but still reserves the 128 MiB top-k mask
+    workspace per attention metadata builder."""
 
     sparse_mla_prefill_workspace_factor: int | None = Field(default=None, ge=2)
     """Sparse MLA prefill workspace size, in multiples of `max_model_len`.

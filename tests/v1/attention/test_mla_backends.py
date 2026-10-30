@@ -172,6 +172,35 @@ def test_glm5_flashinfer_masked_mha_routing(
     )
 
 
+@pytest.mark.parametrize(
+    ("query_len", "seq_len", "has_context", "kv_cache_quantized", "expected"),
+    [
+        (8 * 1024, 8 * 1024, False, False, True),
+        (8 * 1024, 8 * 1024, False, True, True),
+        (8 * 1024, 16 * 1024, True, False, True),
+        # Cached context is gathered with a reader that cannot decode quantized
+        # caches, so those batches stay on sparse MQA.
+        (8 * 1024, 16 * 1024, True, True, False),
+    ],
+)
+def test_glm5_masked_mha_quantized_kv_routing(
+    query_len, seq_len, has_context, kv_cache_quantized, expected
+):
+    assert (
+        _use_masked_mha(
+            backend_name="FLASHMLA_SPARSE",
+            tensor_parallel_size=8,
+            qk_head_dim=256,
+            v_head_dim=256,
+            query_len=query_len,
+            seq_len=seq_len,
+            has_context=has_context,
+            kv_cache_quantized=kv_cache_quantized,
+        )
+        is expected
+    )
+
+
 @pytest.mark.parametrize("qk_rope_head_dim", [64, 0], ids=["rope", "nope"])
 def test_concat_k_nope_k_pe_matches_torch_cat(qk_rope_head_dim):
     """The K concat used by the MLA prefill context loop must equal torch.cat of
