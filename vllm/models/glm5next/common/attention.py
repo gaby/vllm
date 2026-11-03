@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import Glm5NextTextConfig
 
+import vllm.envs as envs
 from vllm.config import (
     CacheConfig,
     VllmConfig,
@@ -29,7 +30,7 @@ from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV32IndexerCache,
     yarn_get_mscale,
 )
-from vllm.model_executor.utils import maybe_disable_graph_partition, refill_derived
+from vllm.model_executor.utils import maybe_disable_graph_partition
 from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
 from vllm.models.glm5next.sparse_indexer import SparseAttnIndexerKpool
 from vllm.platforms import current_platform
@@ -252,7 +253,13 @@ class Indexer(nn.Module):
         self.scale_fmt = "ue8m0"
         self.quant_block_size = 128  # TODO: get from config
         self.topk_indices_buffer = topk_indices_buffer
-        self._wp_fp32: torch.Tensor | None = None
+        # The fp32-epilogue GEMM (``mm(out_dtype=)``) needs half-precision
+        # operands; batch-invariant mode keeps the plain fp32 matmul.
+        self._fp32_out_gate_gemm = (
+            current_platform.is_cuda_alike()
+            and not envs.VLLM_BATCH_INVARIANT
+            and vllm_config.model_config.dtype in (torch.bfloat16, torch.float16)
+        )
 
         # NOTE: (zyongye) we use fp8 naive cache,
         #       where we store value in fp8 and scale in fp32
@@ -294,16 +301,16 @@ class Indexer(nn.Module):
             tail_cache=self.tail_cache,
         )
 
-    def process_weights_after_loading(self) -> None:
-        """Build the fp32 head-gate projection from the loaded weights; reloads
-        refill it in place."""
-        wp = (
-            self.wk_weights_proj.weight.data[self.head_dim :, :]
-            .t()
-            .contiguous()
-            .float()
-        )
-        refill_derived(self, "_wp_fp32", wp)
+    def _head_gate(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """fp32 head-gate logits from the ``weights_proj`` rows of ``wk_weights_proj``.
+
+        Half-precision products are exact in fp32, so the fp32 epilogue equals an
+        fp32 matmul of the upcast operands, without the fp32 copy of the input.
+        """
+        weight = self.wk_weights_proj.weight[self.head_dim :]
+        if self._fp32_out_gate_gemm:
+            return torch.mm(hidden_states, weight.t(), out_dtype=torch.float32)
+        return torch.mm(hidden_states.float(), weight.float().t())
 
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
@@ -312,12 +319,10 @@ class Indexer(nn.Module):
         q = q.view(-1, self.n_head, self.head_dim)
 
         # Compute the head gate in fp32; bf16 error can change near-tie pool
-        # rankings on long-context tasks. Built after weights are loaded.
+        # rankings on long-context tasks.
         kw, _ = self.wk_weights_proj(hidden_states)
         k = kw[:, : self.head_dim]
-        if self._wp_fp32 is None:  # only when post-load processing never ran
-            self.process_weights_after_loading()
-        weights = torch.mm(hidden_states.float(), self._wp_fp32)
+        weights = self._head_gate(hidden_states)
 
         k = _fused_indexer_k_norm(
             k, self.k_norm.weight, self.k_norm.bias, self.head_dim, self.k_norm.eps
